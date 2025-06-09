@@ -22,7 +22,6 @@
 
 </div>
 
----
 
 ## 🎭 **What This Beast Can Do**
 
