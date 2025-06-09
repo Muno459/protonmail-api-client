@@ -1,5 +1,3 @@
-
-
 # ⚡️ Async ProtonMail Python API Client
 
 **Note: This library is now fully async!**
@@ -12,14 +10,15 @@
 
 This is not an official python ProtonMail API client. It allows you to read, send and delete messages in ProtonMail, as well as render a ready-made template with embedded images.
 
-
 ## Installation
 ``` 
 pip install protonmail-api-client
 ```
 
-## Using
-```py
+## Basic Usage
+
+### Login and Read Messages
+```python
 import asyncio
 from protonmail import ProtonMail
 
@@ -52,6 +51,18 @@ async def main():
         with open(f'{first_file.name}', 'wb') as f:
             f.write(first_file.content)
 
+asyncio.run(main())
+```
+
+### Send Messages
+```python
+import asyncio
+from protonmail import ProtonMail
+
+async def main():
+    async with ProtonMail() as proton:
+        await proton.login(username, password)
+        
         # Create attachments
         with open('image.png', 'rb') as f:
             img = f.read()
@@ -72,12 +83,6 @@ async def main():
         </html>
         """
 
-asyncio.run(main())
-
-
-# Send message
-async def main():
-    async with ProtonMail() as proton:
         new_message = proton.create_message(
             recipients=["to1@proton.me", "to2@gmail.com", "Name of recipient <to3@outlook.com>"],
             cc=["cc1@proton.me", "cc2@gmail.com", "Name of recipient <cc3@outlook.com>"],
@@ -102,28 +107,68 @@ async def main():
         # otherwise someone will gain access to your mail.
         await proton.save_session('session.pickle')
 
+asyncio.run(main())
+```
+
+### Session Management
+```python
+import asyncio
+from protonmail import ProtonMail
+
+async def main():
+    async with ProtonMail() as proton:
         # Load session
         await proton.load_session('session.pickle', auto_save=True)
         # Autosave is needed to save tokens if they are updated
         # (the access token is only valid for 24 hours and will be updated automatically)
 
         # Getting a list of all sessions in which you are authorized
-        await proton.get_all_sessions()
+        sessions = await proton.get_all_sessions()
+        print(sessions)
 
         # Revoke all sessions except the current one
         await proton.revoke_all_sessions()
 
-import asyncio
 asyncio.run(main())
 ```
 
-### event polling
+### 🆕 Quick Token-Based Authentication
+
+If you have previously extracted authentication tokens, you can use them directly without full login:
+
+```python
+import asyncio
+from protonmail import ProtonMail
+
+async def main():
+    # Your saved tokens
+    uid = "your_uid_here"
+    auth_token = "your_auth_token"
+    refresh_token = "your_refresh_token"
+    password = "YourPassword123"
+
+    async with ProtonMail() as proton:
+        # Configure tokens for previously logged-in account
+        proton.configure_tokens(uid, auth_token, refresh_token)
+        
+        # Parse login info and save session
+        await proton._parse_info_after_login(password)
+        await proton.save_session('session.pickle')
+        
+        # Now you can use the API
+        messages = await proton.get_messages()
+        print(f"Got {len(messages)} messages")
+
+asyncio.run(main())
+```
+
+### Event Polling
 Event polling. Polling ends in 3 cases:
 1. Callback returns not `None`.
 2. The callback raises the `SystemExit` exception.
 3. Timeout ends.
 
-For example, wait indefinitely until 2 messages arrive.
+For example, wait indefinitely until 2 messages arrive:
 ```python
 import asyncio
 from protonmail import ProtonMail
@@ -136,13 +181,16 @@ async def callback(response: dict, new_messages: list):
 
 async def main():
     async with ProtonMail() as proton:
+        await proton.login(username, password)
         new_messages = []
         await proton.event_polling(callback, new_messages)
         print(new_messages)
 
 asyncio.run(main())
 ```
+
 ## CAPTCHA
+
 ### Solve CAPTCHA
 Instructions to solve CAPTCHA:
 1. At the moment automatic CAPTCHA solving is already implemented (used by default), it uses `cv2` and `NumPy`. Sometimes `CantSolveImageCaptcha` exception may occur, it means you encountered a complex image, just try to log in again.
@@ -173,6 +221,9 @@ Instructions to avoid CAPTCHA:
    4. Wait for your mail to load.
    5. Close the tab.
    6. Repeat this about 10 times, then your account (only this one) can be allowlisted, and authorization (including `protonmail-api-client`) will be without CAPTCHA.
+
+### Extract Tokens from Browser (Manual Session Restore)
+
 5. Use `cookies` from the browser:
    1. Open a browser tab in incognito mode.
    2. Open the login page (https://account.proton.me/mail).
@@ -183,22 +234,73 @@ Instructions to avoid CAPTCHA:
    7. Find the `auth` request in the "Network" tab and open it.
    8. In the "Headers" tab of the request, scroll down to the `Set-Cookie` items in the "Response Headers" list.
    9. Copy the key and value from the cookies: `REFRESH-*`, `AUTH-*`.
-   10. Paste the key and value into the following code (`x-pm-uid` is the part after `AUTH-`).
+   10. Extract the UID (the part after `AUTH-`).
    11. Close the incognito tab (Do not click the "log out" button, otherwise cookies will be invalidated).
+
+![cookies interception](assets/cookies-interception.png)
+
+**Method 1: Using `configure_tokens()` (Recommended):**
+```python
+import asyncio
+from protonmail import ProtonMail
+
+async def main():
+    # Extract these from browser DevTools
+    uid = "lgfbju2dxc1234567890mrf3tqmqfhv6q"  # Part after AUTH-
+    auth_token = "qr4uci1234567890anafsku8dd34vkwq"   # Value of AUTH-{uid} cookie
+    refresh_token = "ceo5gp1234567890fghuinsxxtgmpvdduxg"  # Extract from REFRESH-{uid} cookie JSON
+    password = 'YourPassword123'
+
+    async with ProtonMail() as proton:
+        # One-line configuration
+        proton.configure_tokens(uid, auth_token, refresh_token)
+        await proton._parse_info_after_login(password)
+        await proton.save_session('session.pickle')
+
+asyncio.run(main())
+```
+
+**Method 2: Manual Cookie/Header Setting (Advanced):**
 ```python
 import asyncio
 from protonmail import ProtonMail
 
 async def main():
     async with ProtonMail() as proton:
-        # Set cookies/headers if needed for manual session restore
-        # await proton.set_session_cookies_and_headers(...)
+        # Set manually (backward compatible)
+        proton.session.headers['x-pm-uid'] = 'lgfbju2dxc1234567890mrf3tqmqfhv6q'
+        proton.session.cookies['AUTH-lgfbju2dxc1234567890mrf3tqmqfhv6q'] = 'qr4uci1234567890anafsku8dd34vkwq'
+        proton.session.cookies['REFRESH-lgfbju2dxc1234567890mrf3tqmqfhv6q'] = '%7B%22ResponseType%22%3A%22token%22%2C%22ClientID%22%3A%22WebAccount%22%2C%22GrantType%22%3A%22refresh_token%22%2C%22RefreshToken%22%3A%22ceo5gp1234567890fghuinsxxtgmpvdduxg%22%2C%22UID%22%3A%22lgfbju2dxc1234567890mrf3tqmqfhv6q%22%7D'
+        
         password = 'YourPassword123'
         await proton._parse_info_after_login(password)
         await proton.save_session('session.pickle')
-        # Note: If you need to restore cookies/headers manually, use the appropriate async method or helper.
 
 asyncio.run(main())
-
 ```
-![cookies interception](assets/cookies-interception.png)
+
+## Migration from Synchronous Version
+
+If you're migrating from a previous synchronous version:
+
+1. **Add `async`/`await`**: All network methods are now async
+2. **Use context manager**: Wrap with `async with ProtonMail() as proton:`
+3. **Update function calls**: Add `await` before method calls
+4. **Use `asyncio.run()`**: Wrap your main function call
+
+**Before:**
+```python
+proton = ProtonMail()
+proton.login(username, password)
+messages = proton.get_messages()
+```
+
+**After:**
+```python
+async def main():
+    async with ProtonMail() as proton:
+        await proton.login(username, password)
+        messages = await proton.get_messages()
+
+asyncio.run(main())
+```

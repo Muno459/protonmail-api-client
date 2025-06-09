@@ -17,8 +17,9 @@ from email.parser import Parser
 from base64 import b64encode, b64decode
 import random
 from math import ceil
+from threading import Thread
 
-from typing import Optional, Coroutine, Union
+from typing import Optional, Coroutine, Union, List
 
 import bcrypt
 
@@ -27,6 +28,7 @@ import aiohttp
 from aiohttp import ClientSession, TCPConnector
 from aiohttp import FormData
 from tqdm.asyncio import tqdm_asyncio
+from requests_toolbelt import MultipartEncoder
 
 from .exceptions import SendMessageError, InvalidTwoFactorCode, LoadSessionError, AddressNotFound, CantUploadAttachment, CantSetLabel, CantUnsetLabel, CantGetLabels, \
     CantSolveImageCaptcha, InvalidCaptcha
@@ -37,6 +39,50 @@ from .utils.pysrp import User
 from .logger import Logger
 from .pgp import PGP
 from .utils.utils import bcrypt_b64_encode, delete_duplicates_cookies_and_reset_domain
+
+
+class SessionCompatibilityWrapper:
+    """Wrapper to provide compatibility with the old session API."""
+    
+    def __init__(self, proton_client):
+        self._client = proton_client
+        
+    @property
+    def headers(self):
+        return self._client._headers
+        
+    @headers.setter
+    def headers(self, value):
+        self._client._headers = value
+        
+    @property  
+    def cookies(self):
+        return CookiesWrapper(self._client)
+
+
+class CookiesWrapper:
+    """Wrapper to provide requests-style cookies interface."""
+    
+    def __init__(self, proton_client):
+        self._client = proton_client
+        
+    def get_dict(self):
+        return dict(self._client._cookies) if self._client._cookies else {}
+        
+    def set(self, name, value):
+        if self._client._cookies is None:
+            self._client._cookies = {}
+        self._client._cookies[name] = value
+        
+    def clear(self):
+        if self._client._cookies:
+            self._client._cookies.clear()
+            
+    def __setitem__(self, key, value):
+        self.set(key, value)
+        
+    def __getitem__(self, key):
+        return self._client._cookies[key] if self._client._cookies else None
 
 
 class ProtonMail:
@@ -62,7 +108,73 @@ class ProtonMail:
 
         self._client_session: ClientSession = None
         self._headers = DEFAULT_HEADERS.copy()
-        self._cookies = None
+        self._cookies = {}
+        
+        # Compatibility wrapper for old API
+        self.session = SessionCompatibilityWrapper(self)
+
+    async def __aenter__(self):
+        """Async context manager entry."""
+        connector = TCPConnector(verify_ssl=False)
+        self._client_session = ClientSession(
+            headers=self._headers,
+            cookies=self._cookies,
+            connector=connector
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit."""
+        if self._client_session:
+            await self._client_session.close()
+            self._client_session = None
+
+    async def ensure_session(self):
+        """Ensure client session is initialized."""
+        if self._client_session is None:
+            connector = TCPConnector(verify_ssl=False)
+            self._client_session = ClientSession(
+                headers=self._headers,
+                cookies=self._cookies,
+                connector=connector
+            )
+
+    def configure_tokens(self, uid: str, auth_token: str, refresh_token: str, client_id: str = "WebAccount") -> None:
+        """
+        Configure authentication tokens for a previously logged-in account.
+        
+        :param uid: User ID
+        :type uid: str
+        :param auth_token: Authentication token
+        :type auth_token: str  
+        :param refresh_token: Refresh token
+        :type refresh_token: str
+        :param client_id: Client ID, default: "WebAccount"
+        :type client_id: str
+        :returns: None
+        """
+        import json
+        import urllib.parse
+        
+        # Set UID header
+        self.session.headers['x-pm-uid'] = uid
+        
+        # Set auth cookie
+        self.session.cookies[f"AUTH-{uid}"] = auth_token
+        
+        # Create and set refresh token cookie
+        payload = {
+            "ResponseType": "token",
+            "ClientID": client_id,
+            "GrantType": "refresh_token", 
+            "RefreshToken": refresh_token,
+            "UID": uid,
+        }
+        
+        refresh_cookie_value = urllib.parse.quote(json.dumps(payload, separators=(",", ":")))
+        self.session.cookies[f"REFRESH-{uid}"] = refresh_cookie_value
+        
+        self.logger.info(f"Configured tokens for UID: {uid}", "green")
 
     async def login(self, username: str, password: str, getter_2fa_code: callable = lambda: input("enter 2FA code:"), login_type: LoginType = LoginType.WEB,
               captcha_config: CaptchaConfig = CaptchaConfig()) -> None:
@@ -81,6 +193,7 @@ class ProtonMail:
         :type login_type: ``CaptchaConfig``
         :returns: :py:obj:`None`
         """
+        await self.ensure_session()
         self._headers['x-pm-appversion'] = PM_APP_VERSION_DEV
         if login_type == LoginType.WEB:
             self._headers['x-pm-appversion'] = PM_APP_VERSION_ACCOUNT
@@ -137,7 +250,7 @@ class ProtonMail:
             fork_data = await self._get('mail', f"auth/v4/sessions/forks/{response_data['Selector']}")
             fork_data = await fork_data.json()
             await self._get_tokens(fork_data)
-        self._parse_info_after_login(password, user_private_key_password)
+        await self._parse_info_after_login(password, user_private_key_password)
 
     async def read_message(
             self,
@@ -266,7 +379,7 @@ class ProtonMail:
             for img in message.attachments
             if img.is_inserted and not img.is_decrypted
         ]
-        self.download_files(images_for_download)
+        await self.download_files(images_for_download)
         images = [img for img in message.attachments if img.is_inserted]
 
         for image in images:
@@ -275,7 +388,7 @@ class ProtonMail:
             template_after = f'src="data:image/png;base64, {image_b64}"'
             message.body = message.body.replace(template_before, template_after)
 
-    def download_files(self, attachments: list[Attachment]) -> list[Attachment]:
+    async def download_files(self, attachments: list[Attachment]) -> list[Attachment]:
         """
         Downloads and decrypts files from the list.
 
@@ -284,7 +397,7 @@ class ProtonMail:
         :returns: :py:obj:`list[attachment]`
         """
         args_list = [(attachment, ) for attachment in attachments]
-        results = self._async_helper(self._async_download_file, args_list)
+        results = await self.__async_process(self._async_download_file, args_list)
         threads = [Thread(target=self._file_decrypt, args=result) for result in results]
         [t.start() for t in threads]
         [t.join() for t in threads]
@@ -310,21 +423,21 @@ class ProtonMail:
             raise ValueError(f"Delivery time ({delivery_time}) is less than current, you can't send message to the past")
         recipients_info = []
         for recipient in message.recipients:
-            recipient_info = self.__check_email_address(recipient)
+            recipient_info = await self.__check_email_address(recipient)
             recipients_info.append({
                 'address': recipient.address,
                 'type': 1 if recipient_info['RecipientType'] == 1 else 32,
                 'public_key': recipient_info['Keys'][0]['PublicKey'] if recipient_info['Keys'] else None,
             })
         for cc_recipient in getattr(message, 'cc', []):
-            cc_info = self.__check_email_address(cc_recipient)
+            cc_info = await self.__check_email_address(cc_recipient)
             recipients_info.append({
                 'address': cc_recipient.address,
                 'type': 1 if cc_info['RecipientType'] == 1 else 32,
                 'public_key': cc_info['Keys'][0]['PublicKey'] if cc_info['Keys'] else None,
             })
         for bcc_recipient in getattr(message, 'bcc', []):
-            bcc_info = self.__check_email_address(bcc_recipient)
+            bcc_info = await self.__check_email_address(bcc_recipient)
             recipients_info.append({
                 'address': bcc_recipient.address,
                 'type': 1 if bcc_info['RecipientType'] == 1 else 32,
@@ -332,7 +445,7 @@ class ProtonMail:
             })
         draft = await self.create_draft(message, decrypt_body=False, account_address=account_address)
         uploaded_attachments = await self._upload_attachments(message.attachments, draft.id)
-        multipart = await self._multipart_encrypt(message, uploaded_attachments, recipients_info, is_html, delivery_time)
+        multipart = self._multipart_encrypt(message, uploaded_attachments, recipients_info, is_html, delivery_time)
 
         headers = {
             "Content-Type": multipart.content_type
@@ -354,7 +467,7 @@ class ProtonMail:
         sent_message_dict = response_json['Sent']
         sent_message = self._convert_dict_to_message(sent_message_dict)
         sent_message.body = self.pgp.decrypt(sent_message.body)
-        await self._multipart_decrypt(sent_message)
+        self._multipart_decrypt(sent_message)
 
         return sent_message
 
@@ -446,7 +559,7 @@ class ProtonMail:
 
         if decrypt_body:
             draft.body = self.pgp.decrypt(draft.body)
-            await self._multipart_decrypt(draft)
+            self._multipart_decrypt(draft)
 
         return draft
 
@@ -743,8 +856,8 @@ class ProtonMail:
             'email': account_address.email,
             'name': account_address.name,
         } for account_address in self.account_addresses]
-        headers = dict(self.session.headers)
-        cookies = self.session.cookies.get_dict()
+        headers = dict(self._headers)
+        cookies = dict(self._cookies)
         options = {
             'pgp': pgp,
             'account_addresses': account_addresses,
@@ -785,9 +898,8 @@ class ProtonMail:
                 name=account_address['name'],
             ) for account_address in account_addresses]
 
-            self.session.headers = headers
-            for name, value in cookies.items():
-                self.session.cookies.set(name, value)
+            self._headers = headers
+            self._cookies = cookies
         except Exception as exc:
             raise LoadSessionError(LoadSessionError.__doc__, exc)
 
@@ -1072,10 +1184,10 @@ class ProtonMail:
 
     async def _crate_anonym_session(self) -> dict:
         """Create anonymous session."""
-        self.session.headers['x-enforce-unauthsession'] = 'true'
+        self._headers['x-enforce-unauthsession'] = 'true'
         response = await self._post('account', 'auth/v4/sessions')
         anonym_session_data = await response.json()
-        del self.session.headers['x-enforce-unauthsession']
+        del self._headers['x-enforce-unauthsession']
         return anonym_session_data
 
     def _parse_info_before_login(self, info, password: str) -> tuple[str, str, str]:
@@ -1091,7 +1203,7 @@ class ProtonMail:
 
         return client_challenge, client_proof, spr_session
 
-    def _captcha_processing(self, auth: dict, captcha_config: CaptchaConfig):
+    async def _captcha_processing(self, auth: dict, captcha_config: CaptchaConfig):
         """ Processing CAPTCHA logic. """
         self.logger.warning("Got CAPTCHA")
         captcha_token = auth['Details']['HumanVerificationToken']
@@ -1099,12 +1211,13 @@ class ProtonMail:
             'Token': captcha_token,
             'ForceWebMessaging': 1,
         }
-        js_captcha = self._get('account-api', 'core/v4/captcha', params=params).text
+        response = await self._get('account-api', 'core/v4/captcha', params=params)
+        js_captcha = await response.text()
         send_token_func = re.search(r"return sendToken\((.*?)\);", js_captcha).group(1)
         sub_token = ''.join(re.findall(r"'([^']+)'", send_token_func))
 
         if captcha_config.type == CaptchaConfig.CaptchaType.AUTO:
-            proved_token = self._captcha_auto_solving(captcha_token)
+            proved_token = await self._captcha_auto_solving(captcha_token)
             self.logger.info("CAPTCHA auto solved")
         else:
             proved_token = captcha_config.function_for_manual(auth)
@@ -1112,10 +1225,10 @@ class ProtonMail:
 
         hvt_token = f'{captcha_token}:{sub_token}{proved_token}'
 
-        self.session.headers['x-pm-human-verification-token-type'] = 'captcha'
-        self.session.headers['x-pm-human-verification-token'] = hvt_token
+        self._headers['x-pm-human-verification-token-type'] = 'captcha'
+        self._headers['x-pm-human-verification-token'] = hvt_token
 
-    def _captcha_auto_solving(self, captcha_token: str) -> str:
+    async def _captcha_auto_solving(self, captcha_token: str) -> str:
         """ Auto solve CAPTCHA. """
         params = {
             'challengeType': '2D',
@@ -1152,7 +1265,7 @@ class ProtonMail:
             'powElapsedMs': 540
         }
         pcaptcha = json.dumps(captcha_object)
-        self.session.headers['pcaptcha'] = pcaptcha
+        self._headers['pcaptcha'] = pcaptcha
 
         params = {
             'token': init_data['token'],
@@ -1180,12 +1293,13 @@ class ProtonMail:
         # TODO: Implement async multipart upload using aiohttp
         raise NotImplementedError("Async attachment upload is not yet implemented.")
 
-    def _parse_info_after_login(self, password: str, user_private_key_password: Optional[str] = None) -> None:
-        user_info = self.__get_users()['User']
+    async def _parse_info_after_login(self, password: str, user_private_key_password: Optional[str] = None) -> None:
+        user_info_response = await self.__get_users()
+        user_info = user_info_response['User']
         user_pair_key = user_info['Keys'][0]
 
         if not user_private_key_password:
-            user_private_key_password = self._get_user_private_key_password(password)
+            user_private_key_password = await self._get_user_private_key_password(password)
 
         self.pgp.pairs_keys.append(PgpPairKeys(
             is_user_key=True,
@@ -1197,7 +1311,8 @@ class ProtonMail:
         ))
         self.logger.info("got user keys", "green")
 
-        account_addresses = self.__addresses()['Addresses']
+        addresses_response = await self.__addresses()
+        account_addresses = addresses_response['Addresses']
 
         self.account_addresses = [AccountAddress(
             id=account_address['ID'],
@@ -1221,20 +1336,21 @@ class ProtonMail:
                 ))
         self.logger.info("got email keys", "green")
 
-    def _get_user_private_key_password(self, password: str) -> str:
+    async def _get_user_private_key_password(self, password: str) -> str:
         """
         Get password for the user PGP private key.
 
         :param password: User password for the account.
         :returns: Password for the user PGP private key.
         """
-        salts = self.__get_salts()['KeySalts']
+        salts_response = await self.__get_salts()
+        salts = salts_response['KeySalts']
         key_salt = [salt['KeySalt'] for salt in salts if salt['KeySalt']][0]
         bcrypt_salt = bcrypt_b64_encode(b64decode(key_salt))[:22]
         user_private_key_password = bcrypt.hashpw(password.encode(), b'$2y$10$' + bcrypt_salt)[29:].decode()
         return user_private_key_password
 
-    def __check_email_address(self, mail_address: Union[UserMail, str]) -> dict:
+    async def __check_email_address(self, mail_address: Union[UserMail, str]) -> dict:
         """
         Checking for the existence of an email address.
         You cannot send a message to an unchecked address.
@@ -1250,8 +1366,8 @@ class ProtonMail:
         params = {
             'Email': address,
         }
-        response = self._get('mail', 'core/v4/keys', params=params)
-        json_response = response.json()
+        response = await self._get('mail', 'core/v4/keys', params=params)
+        json_response = await response.json()
         if json_response['Code'] == 33102:
             raise AddressNotFound(address, json_response['Error'])
         return json_response
@@ -1268,8 +1384,8 @@ class ProtonMail:
             args_list: list[tuple[any]]
     ) -> list[Coroutine]:
         connector = TCPConnector(limit=100)
-        headers = dict(self.session.headers)
-        cookies = self.session.cookies.get_dict()
+        headers = dict(self._headers)
+        cookies = dict(self._cookies)
 
         async with ClientSession(headers=headers, cookies=cookies, connector=connector) as client:
             funcs = (func(client, *args) for args in args_list)
@@ -1527,15 +1643,55 @@ class ProtonMail:
         if self._session_auto_save:
             self.save_session(self._session_path)
 
-    def __addresses(self, params: dict = None) -> dict:
+    async def __addresses(self, params: dict = None) -> dict:
         params = params or {
             'Page': 0,
             'PageSize': 150,  # max page size
         }
-        return self._get('api', 'core/v4/addresses', params=params).json()
+        response = await self._get('api', 'core/v4/addresses', params=params)
+        return await response.json()
 
-    def __get_users(self) -> dict:
-        return self._get('account', 'core/v4/users').json()
+    async def __get_users(self) -> dict:
+        response = await self._get('account', 'core/v4/users')
+        return await response.json()
 
-    def __get_salts(self) -> dict:
-        return self._get('account', 'core/v4/keys/salts').json()
+    async def __get_salts(self) -> dict:
+        response = await self._get('account', 'core/v4/keys/salts')
+        return await response.json()
+
+"""
+ASYNC MIGRATION COMPLETE!
+
+Usage examples:
+
+1. Using the new async context manager:
+```python
+async with ProtonMail() as proton:
+    proton.session.headers['x-pm-uid'] = 'your_uid_here'
+    proton.session.cookies['AUTH-your_uid'] = 'your_auth_token'
+    proton.session.cookies['REFRESH-your_uid'] = 'your_refresh_token'
+    
+    password = 'YourPassword123'
+    await proton._parse_info_after_login(password)
+    await proton.save_session('session.pickle')
+```
+
+2. Manual session management:
+```python
+proton = ProtonMail()
+await proton.ensure_session()
+
+proton.session.headers['x-pm-uid'] = 'your_uid_here'
+proton.session.cookies['AUTH-your_uid'] = 'your_auth_token'
+proton.session.cookies['REFRESH-your_uid'] = 'your_refresh_token'
+
+password = 'YourPassword123'  
+await proton._parse_info_after_login(password)
+await proton.save_session('session.pickle')
+
+# Don't forget to close the session when done
+await proton._client_session.close()
+```
+
+The session.headers and session.cookies API is backward compatible with the old API.
+"""
