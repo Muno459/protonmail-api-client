@@ -4,6 +4,7 @@ import asyncio
 import json
 import mimetypes
 import pickle
+import aiofiles
 import re
 import string
 import time
@@ -16,16 +17,15 @@ from email.parser import Parser
 from base64 import b64encode, b64decode
 import random
 from math import ceil
-from threading import Thread
+
 from typing import Optional, Coroutine, Union
 
 import bcrypt
 
 import unicodedata
-from requests import Session
-from requests.models import Response
+import aiohttp
 from aiohttp import ClientSession, TCPConnector
-from requests_toolbelt import MultipartEncoder
+from aiohttp import FormData
 from tqdm.asyncio import tqdm_asyncio
 
 from .exceptions import SendMessageError, InvalidTwoFactorCode, LoadSessionError, AddressNotFound, CantUploadAttachment, CantSetLabel, CantUnsetLabel, CantGetLabels, \
@@ -60,11 +60,11 @@ class ProtonMail:
         self._session_auto_save = False
         self.account_addresses: list[AccountAddress] = []
 
-        self.session = Session()
-        self.session.proxies = {'http': self.proxy, 'https': self.proxy} if self.proxy else dict()
-        self.session.headers.update(DEFAULT_HEADERS)
+        self._client_session: ClientSession = None
+        self._headers = DEFAULT_HEADERS.copy()
+        self._cookies = None
 
-    def login(self, username: str, password: str, getter_2fa_code: callable = lambda: input("enter 2FA code:"), login_type: LoginType = LoginType.WEB,
+    async def login(self, username: str, password: str, getter_2fa_code: callable = lambda: input("enter 2FA code:"), login_type: LoginType = LoginType.WEB,
               captcha_config: CaptchaConfig = CaptchaConfig()) -> None:
         """
         Authorization in ProtonMail.
@@ -81,76 +81,65 @@ class ProtonMail:
         :type login_type: ``CaptchaConfig``
         :returns: :py:obj:`None`
         """
-        self.session.headers['x-pm-appversion'] = PM_APP_VERSION_DEV
+        self._headers['x-pm-appversion'] = PM_APP_VERSION_DEV
         if login_type == LoginType.WEB:
-            self.session.headers['x-pm-appversion'] = PM_APP_VERSION_ACCOUNT
-
-            anonym_session_info = self._crate_anonym_session()
-
-            self._get_tokens(anonym_session_info)  # Cookies for anonym user (not logged in the account yet)
-
+            self._headers['x-pm-appversion'] = PM_APP_VERSION_ACCOUNT
+            anonym_session_info = await self._crate_anonym_session()
+            await self._get_tokens(anonym_session_info)
         data = {'Username': username}
-
-        info = self._post('account', 'core/v4/auth/info', json=data).json()
+        info = await self._post('account', 'core/v4/auth/info', json=data)
+        info = await info.json()
         client_challenge, client_proof, spr_session = self._parse_info_before_login(info, password)
-
-        auth = self._post('account', 'core/v4/auth', json={
+        auth = await self._post('account', 'core/v4/auth', json={
             'Username': username,
             'ClientEphemeral': client_challenge,
             'ClientProof': client_proof,
             'SRPSession': spr_session,
             'PersistentCookies': 1,
-        }).json()
-
+        })
+        auth = await auth.json()
         if auth['Code'] == 9001:  # Captcha
-            self._captcha_processing(auth, captcha_config)
-
-            auth = self._post('account', 'core/v4/auth', json={
+            await self._captcha_processing(auth, captcha_config)
+            auth = await self._post('account', 'core/v4/auth', json={
                 'Username': username,
                 'ClientEphemeral': client_challenge,
                 'ClientProof': client_proof,
                 'SRPSession': spr_session,
                 'PersistentCookies': 1,
-            }).json()
-
+            })
+            auth = await auth.json()
         if self._login_process(auth):
             self.logger.info("login success", "green")
         else:
             self.logger.error("login failure")
-
         if login_type == LoginType.DEV:
-            self._get_tokens(auth)
-
+            await self._get_tokens(auth)
         if auth["TwoFactor"]:
             if not auth["2FA"]["TOTP"]:
                 raise NotImplementedError("Two-Factor Authentication(2FA) implemented only TOTP, disable FIDO2/U2F")
             domain = 'account' if login_type == LoginType.WEB else 'mail'
-            response_2fa = self._post(domain, 'core/v4/auth/2fa', json={'TwoFactorCode': getter_2fa_code()})
-            if response_2fa.status_code != 200:
-                raise InvalidTwoFactorCode(f"Invalid Two-Factor Authentication(2FA) code: {response_2fa.json()['Error']}")
-
+            response_2fa = await self._post(domain, 'core/v4/auth/2fa', json={'TwoFactorCode': getter_2fa_code()})
+            if response_2fa.status != 200:
+                raise InvalidTwoFactorCode(f"Invalid Two-Factor Authentication(2FA) code: {(await response_2fa.json())['Error']}")
         user_private_key_password = self._get_user_private_key_password(password)
         if login_type == LoginType.WEB:
             user_pk_password_data = {'type': 'default', 'keyPassword': user_private_key_password}
             encrypted_user_pk_password_data = self.pgp.aes_gcm_encrypt(json.dumps(user_pk_password_data, separators=(',', ':')))
             b64_encrypted_user_pk_password_data = b64encode(encrypted_user_pk_password_data).decode()
-
             payload_for_create_fork = {
                 'Payload': b64_encrypted_user_pk_password_data,
                 'ChildClientID': 'web-mail',
                 'Independent': 0,
             }
-
-            response_data = self._post('account', 'auth/v4/sessions/forks', json=payload_for_create_fork).json()
-
-            self.session.headers['x-pm-appversion'] = PM_APP_VERSION_MAIL
-            fork_data = self._get('mail', f"auth/v4/sessions/forks/{response_data['Selector']}").json()
-
-            self._get_tokens(fork_data)
-
+            response_data = await self._post('account', 'auth/v4/sessions/forks', json=payload_for_create_fork)
+            response_data = await response_data.json()
+            self._headers['x-pm-appversion'] = PM_APP_VERSION_MAIL
+            fork_data = await self._get('mail', f"auth/v4/sessions/forks/{response_data['Selector']}")
+            fork_data = await fork_data.json()
+            await self._get_tokens(fork_data)
         self._parse_info_after_login(password, user_private_key_password)
 
-    def read_message(
+    async def read_message(
             self,
             message_or_id: Union[Message, str],
             mark_as_read: Optional[bool] = True
@@ -166,19 +155,19 @@ class ProtonMail:
         :returns: :py:obj:`Message`
         """
         _id = message_or_id.id if isinstance(message_or_id, Message) else message_or_id
-        response = self._get('mail', f'mail/v4/messages/{_id}')
-        message = response.json()['Message']
-        message = self._convert_dict_to_message(message)
+        response = await self._get('mail', f'mail/v4/messages/{_id}')
+        message_json = await response.json()
+        message = self._convert_dict_to_message(message_json['Message'])
 
         message.body = self.pgp.decrypt(message.body)
         self._multipart_decrypt(message)
 
         if mark_as_read:
-            self.mark_messages_as_read([message])
+            await self.mark_messages_as_read([message])
 
         return message
 
-    def get_messages(self, page_size: Optional[int] = 150, label_or_id: Union[Label, str] = '5') -> list[Message]:
+    async def get_messages(self, page_size: Optional[int] = 150, label_or_id: Union[Label, str] = '5') -> list[Message]:
         """
         Get all messages, sorted by time.
 
@@ -187,29 +176,32 @@ class ProtonMail:
         :returns: :py:obj:`list[Message]`
         """
         label_id = label_or_id.id if isinstance(label_or_id, Label) else label_or_id
-        count_page = ceil(self.get_messages_count()[5]['Total'] / page_size)
-        args_list = [(page_num, page_size, label_id) for page_num in range(count_page)]
-        messages_lists = self._async_helper(self._async_get_messages, args_list)
+        count_info = await self.get_messages_count()
+        count_page = ceil(count_info[5]['Total'] / page_size)
+        messages_lists = []
+        for page_num in range(count_page):
+            page_messages = await self._async_get_messages(self._client_session, page_num, page_size, label_id)
+            messages_lists.append(page_messages)
         messages_dict = self._flattening_lists(messages_lists)
         messages = [self._convert_dict_to_message(message) for message in messages_dict]
-
         return messages
 
-    def get_messages_by_page(self, page: int, page_size: Optional[int] = 150) -> list[Message]:
+    async def get_messages_by_page(self, page: int, page_size: Optional[int] = 150) -> list[Message]:
         """Get messages by page, sorted by time."""
-        args_list = [(page, page_size)]
-        messages_lists = self._async_helper(self._async_get_messages, args_list)
+        messages_lists = []
+        page_messages = await self._async_get_messages(self._client_session, page, page_size)
+        messages_lists.append(page_messages)
         messages_dict = self._flattening_lists(messages_lists)
         messages = [self._convert_dict_to_message(message) for message in messages_dict]
-
         return messages
 
-    def get_messages_count(self) -> list[dict]:
+    async def get_messages_count(self) -> list[dict]:
         """get total count of messages, count of unread messages."""
-        response = self._get('mail', 'mail/v4/messages/count').json()['Counts']
-        return response
+        response = await self._get('mail', 'mail/v4/messages/count')
+        json_obj = await response.json()
+        return json_obj['Counts']
 
-    def read_conversation(self, conversation_or_id: Union[Conversation, str]) -> list[Message]:
+    async def read_conversation(self, conversation_or_id: Union[Conversation, str]) -> list[Message]:
         """
         Read conversation by conversation or ID.
 
@@ -221,43 +213,46 @@ class ProtonMail:
             conversation_or_id.id
             if isinstance(conversation_or_id, Conversation)
             else conversation_or_id)
-        response = self._get('mail', f'mail/v4/conversations/{_id}')
-        messages = response.json()['Messages']
+        response = await self._get('mail', f'mail/v4/conversations/{_id}')
+        json_obj = await response.json()
+        messages = json_obj['Messages']
         messages = [self._convert_dict_to_message(message) for message in messages]
         messages[-1].body = self.pgp.decrypt(messages[-1].body)
         self._multipart_decrypt(messages[-1])
-
         return messages
 
-    def get_conversations(self, page_size: Optional[int] = 150) -> list[Conversation]:
+    async def get_conversations(self, page_size: Optional[int] = 150) -> list[Conversation]:
         """Get all conversations, sorted by time."""
-        count_page = ceil(self.get_messages_count()[0]['Total'] / page_size)
-        args_list = [(page_num, page_size) for page_num in range(count_page)]
-        conversations_lists = self._async_helper(self._async_get_conversations, args_list)
+        count_info = await self.get_conversations_count()
+        count_page = ceil(count_info[0]['Total'] / page_size)
+        conversations_lists = []
+        for page_num in range(count_page):
+            page_convos = await self._async_get_conversations(self._client_session, page_num, page_size)
+            conversations_lists.append(page_convos)
         conversations_dict = self._flattening_lists(conversations_lists)
         conversations = [self._convert_dict_to_conversation(c) for c in conversations_dict]
-
         return conversations
 
-    def get_conversations_by_page(
+    async def get_conversations_by_page(
             self,
             page: int,
             page_size: Optional[int] = 150
     ) -> list[Conversation]:
         """Get conversations by page, sorted by time."""
-        args_list = [(page, page_size)]
-        conversations_lists = self._async_helper(self._async_get_conversations, args_list)
+        conversations_lists = []
+        page_convos = await self._async_get_conversations(self._client_session, page, page_size)
+        conversations_lists.append(page_convos)
         conversations_dict = self._flattening_lists(conversations_lists)
         conversations = [self._convert_dict_to_conversation(c) for c in conversations_dict]
-
         return conversations
 
-    def get_conversations_count(self) -> list[dict]:
+    async def get_conversations_count(self) -> list[dict]:
         """get total count of conversations, count of unread conversations."""
-        response = self._get('mail', 'mail/v4/conversations/count').json()['Counts']
-        return response
+        response = await self._get('mail', 'mail/v4/conversations/count')
+        json_obj = await response.json()
+        return json_obj['Counts']
 
-    def render(self, message: Message) -> None:
+    async def render(self, message: Message) -> None:
         """
         Downloads pictures, decrypts, encodes in BASE64 and inserts into HTML.
 
@@ -296,7 +291,7 @@ class ProtonMail:
 
         return attachments
 
-    def send_message(self, message: Message, is_html: bool = True, delivery_time: Optional[int] = None, account_address: Optional[AccountAddress] = None) -> Message:
+    async def send_message(self, message: Message, is_html: bool = True, delivery_time: Optional[int] = None, account_address: Optional[AccountAddress] = None) -> Message:
         """
         Send the message.
 
@@ -335,9 +330,9 @@ class ProtonMail:
                 'type': 1 if bcc_info['RecipientType'] == 1 else 32,
                 'public_key': bcc_info['Keys'][0]['PublicKey'] if bcc_info['Keys'] else None,
             })
-        draft = self.create_draft(message, decrypt_body=False, account_address=account_address)
-        uploaded_attachments = self._upload_attachments(message.attachments, draft.id)
-        multipart = self._multipart_encrypt(message, uploaded_attachments, recipients_info, is_html, delivery_time)
+        draft = await self.create_draft(message, decrypt_body=False, account_address=account_address)
+        uploaded_attachments = await self._upload_attachments(message.attachments, draft.id)
+        multipart = await self._multipart_encrypt(message, uploaded_attachments, recipients_info, is_html, delivery_time)
 
         headers = {
             "Content-Type": multipart.content_type
@@ -346,23 +341,24 @@ class ProtonMail:
             'Source': 'composer',
         }
 
-        response = self._post(
+        response = await self._post(
             'mail',
             f'mail/v4/messages/{draft.id}',
             headers=headers,
             params=params,
             data=multipart
-        ).json()
-        if response.get('Error'):
-            raise SendMessageError(f"Can't send message: {response['Error']}")
-        sent_message_dict = response['Sent']
+        )
+        response_json = await response.json()
+        if response_json.get('Error'):
+            raise SendMessageError(f"Can't send message: {response_json['Error']}")
+        sent_message_dict = response_json['Sent']
         sent_message = self._convert_dict_to_message(sent_message_dict)
         sent_message.body = self.pgp.decrypt(sent_message.body)
-        self._multipart_decrypt(sent_message)
+        await self._multipart_decrypt(sent_message)
 
         return sent_message
 
-    def create_draft(self, message: Message, decrypt_body: Optional[bool] = True, account_address: Optional[AccountAddress] = None) -> Message:
+    async def create_draft(self, message: Message, decrypt_body: Optional[bool] = True, account_address: Optional[AccountAddress] = None) -> Message:
         """Create the draft."""
         if not account_address:
             account_address = self.account_addresses[0]
@@ -386,8 +382,9 @@ class ProtonMail:
                 "ExternalID": in_reply_to,
                 "AddressID": account_address.id,
             }
-            resp = self._get('mail', 'mail/v4/messages', params=filter_params).json()
-            msgs = resp.get("Messages", [])
+            resp = await self._get('mail', 'mail/v4/messages', params=filter_params)
+            resp_json = await resp.json()
+            msgs = resp_json.get("Messages", [])
             if msgs:
                 parent_id = msgs[0]["ID"]
             else:
@@ -437,29 +434,31 @@ class ProtonMail:
                 }
             )
 
-        response = self._post(
+        response = await self._post(
             'mail',
             'mail/v4/messages',
             json=data
-        ).json()['Message']
+        )
+        response_json = await response.json()
+        message_dict = response_json['Message']
 
-        draft = self._convert_dict_to_message(response)
+        draft = self._convert_dict_to_message(message_dict)
 
         if decrypt_body:
             draft.body = self.pgp.decrypt(draft.body)
-            self._multipart_decrypt(draft)
+            await self._multipart_decrypt(draft)
 
         return draft
 
-    def delete_messages(self, messages_or_ids: list[Union[Message, str]]) -> None:
+    async def delete_messages(self, messages_or_ids: list[Union[Message, str]]) -> None:
         """Delete messages."""
         ids = [i.id if isinstance(i, Message) else i for i in messages_or_ids]
         data = {
             "IDs": ids,
         }
-        self._put('mail', 'mail/v4/messages/delete', json=data)
+        await self._put('mail', 'mail/v4/messages/delete', json=data)
 
-    def mark_messages_as_read(self, messages_or_ids: list[Union[Message, str]]) -> None:
+    async def mark_messages_as_read(self, messages_or_ids: list[Union[Message, str]]) -> None:
         """
         Mark as read messages.
 
@@ -470,9 +469,9 @@ class ProtonMail:
         data = {
             'IDs': ids,
         }
-        self._put('mail', 'mail/v4/messages/read', json=data)
+        await self._put('mail', 'mail/v4/messages/read', json=data)
 
-    def mark_messages_as_unread(self, messages_or_ids: list[Union[Message, str]]) -> None:
+    async def mark_messages_as_unread(self, messages_or_ids: list[Union[Message, str]]) -> None:
         """
         Mark as unread messages.
 
@@ -483,9 +482,9 @@ class ProtonMail:
         data = {
             'IDs': ids,
         }
-        self._put('mail', 'mail/v4/messages/unread', json=data)
+        await self._put('mail', 'mail/v4/messages/unread', json=data)
 
-    def mark_conversations_as_read(self, conversations_or_ids: list[Union[Conversation, str]]) -> None:
+    async def mark_conversations_as_read(self, conversations_or_ids: list[Union[Conversation, str]]) -> None:
         """
         Mark as read conversations.
 
@@ -496,9 +495,9 @@ class ProtonMail:
         data = {
             'IDs': ids,
         }
-        self._put('mail', 'mail/v4/conversations/read', json=data)
+        await self._put('mail', 'mail/v4/conversations/read', json=data)
 
-    def mark_conversations_as_unread(self, conversations_or_ids: list[Union[Conversation, str]]) -> None:
+    async def mark_conversations_as_unread(self, conversations_or_ids: list[Union[Conversation, str]]) -> None:
         """
         Mark as unread conversations.
 
@@ -509,9 +508,9 @@ class ProtonMail:
         data = {
             'IDs': ids,
         }
-        self._put('mail', 'mail/v4/conversations/unread', json=data)
+        await self._put('mail', 'mail/v4/conversations/unread', json=data)
 
-    def wait_for_new_message(
+    async def wait_for_new_message(
             self,
             *args,
             interval: int = 1,
@@ -530,13 +529,13 @@ class ProtonMail:
         :param rise_timeout: raise exception on `timeout` completion. default `False`.
         :type rise_timeout: `bool`
         :param read_message: read message if `True` else the message will not be read and the body will be empty.
-                            default `False`.
+                                default `False`.
         :type read_message: `bool`
         :returns :  new message.
         :rtype: `Message`
         :raises TimeoutError: at the end of the `timeout` only if the `rise_timeout` is `True`
         """
-        def func(response: dict):
+        async def func(response: dict):
             messages = response.get('Messages', [])
             for message in messages:
                 if message.get('Action') != 1:  # new message
@@ -544,9 +543,11 @@ class ProtonMail:
                 new_message = self._convert_dict_to_message(message['Message'])
                 if new_message.is_draft():  # skip saving draft
                     continue
+                await self.pgp.decrypt(new_message.body)
+                await self._multipart_decrypt(new_message)
                 return new_message
             return None
-        message = self.event_polling(
+        message = await self.event_polling(
             func,
             *args,
             interval=interval,
@@ -554,12 +555,12 @@ class ProtonMail:
             rise_timeout=rise_timeout,
             **kwargs,
         )
-        if read_message:
-            message = self.read_message(message)
+        if read_message and message is not None:
+            message = await self.read_message(message)
 
         return message
 
-    def event_polling(
+    async def event_polling(
             self,
             callback: callable,
             *args: any,
@@ -590,8 +591,9 @@ class ProtonMail:
         :returns :  the same as the `callback`.
         :raises TimeoutError: at the end of the `timeout` only if the `rise_timeout` is `True`
         """
-        response = self._get('mail', 'core/v4/events/latest').json()
-        event_id = response['EventID']
+        response = await self._get('mail', 'core/v4/events/latest')
+        response_json = await response.json()
+        event_id = response_json['EventID']
         if timeout:
             start_pooling_time = time.time()
             end_pooling_time = start_pooling_time + timeout
@@ -599,13 +601,13 @@ class ProtonMail:
             end_pooling_time = float('inf')
 
         while time.time() <= end_pooling_time:
-            response = self._get('mail', f'core/v4/events/{event_id}')
+            response = await self._get('mail', f'core/v4/events/{event_id}')
             start_time = time.time()
-            response = response.json()
+            response = await response.json()
             event_id = response.get('EventID', event_id)
             end_time = start_time + interval
             try:
-                returned = callback(response, *args, **kwargs)
+                returned = await callback(response, *args, **kwargs)
                 if returned is not None:
                     return returned
             except SystemExit:
@@ -613,12 +615,12 @@ class ProtonMail:
             need_sleep = end_time - time.time()
             if need_sleep < 0:
                 continue
-            time.sleep(need_sleep)
+            await asyncio.sleep(need_sleep)
         if rise_timeout:
             raise TimeoutError
         return None
 
-    def get_labels_by_type_id(self, type_id: int) -> list[Label]:
+    async def get_labels_by_type_id(self, type_id: int) -> list[Label]:
         """
         Get labels by type id
 
@@ -633,61 +635,20 @@ class ProtonMail:
         params = {
             'Type': type_id,
         }
-        response = self._get('mail', 'core/v4/labels', params=params).json()
-        if response['Code'] not in [1000, 1001]:
-            raise CantGetLabels(response['Error'])
+        response = await self._get('mail', 'core/v4/labels', params=params)
+        response_json = await response.json()
+        if response_json['Code'] not in [1000, 1001]:
+            raise CantGetLabels(response_json['Error'])
         type_mapper = {
             1: 'user label',
             2: 'undefined',
             3: 'user folder',
-            4: 'system folder',
+            4: 'system label',
         }
-        labels = [
-            Label(
-                id=label['ID'],
-                name=label['Name'],
-                path=label['Path'],
-                type=label['Type'],
-                type_name=type_mapper[label['Type']],
-                color=label['Color'],
-                notify=label['Notify'],
-                display=label['Display'],
-                parent_id=label.get('ParentID'),
-            )
-            for label in response['Labels']
-        ]
+        labels = response_json['Labels']
+        return [Label(**label, type=type_mapper.get(label['Type'], 'unknown')) for label in labels]
 
-        return labels
-
-    def get_all_labels(self) -> list[Label]:
-        """Get all labels."""
-        labels = []
-        labels1 = self.get_user_folders()
-        labels2 = self.get_labels_by_type_id(2)
-        labels3 = self.get_user_labels()
-        labels4 = self.get_system_labels()
-        labels.extend(labels1)
-        labels.extend(labels2)
-        labels.extend(labels3)
-        labels.extend(labels4)
-        return labels
-
-    def get_system_labels(self) -> list[Label]:
-        """Get ProtonMail's system labels."""
-        labels = self.get_labels_by_type_id(4)
-        return labels
-
-    def get_user_labels(self) -> list[Label]:
-        """Get user's labels."""
-        labels = self.get_labels_by_type_id(3)
-        return labels
-
-    def get_user_folders(self) -> list[Label]:
-        """Get user's folders."""
-        labels = self.get_labels_by_type_id(1)
-        return labels
-
-    def set_label_for_messages(self, label_or_id: Union[Label, str], messages_or_ids: list[Message, str]) -> None:
+    async def set_label_for_messages(self, label_or_id: Union[Label, str], messages_or_ids: list[Message, str]) -> None:
         """
         Set label for messages.
 
@@ -699,11 +660,12 @@ class ProtonMail:
             'LabelID': label_or_id.id if isinstance(label_or_id, Label) else label_or_id,
             'IDs': message_ids,
         }
-        response = self._put('mail', 'mail/v4/messages/label', json=payload).json()
-        if response['Code'] not in [1000, 1001]:
-            raise CantSetLabel(response['Error'])
+        response = await self._put('mail', 'mail/v4/messages/label', json=payload)
+        response_json = await response.json()
+        if response_json['Code'] not in [1000, 1001]:
+            raise CantSetLabel(response_json['Error'])
         errors = []
-        for resp in response['Responses']:
+        for resp in response_json['Responses']:
             if resp['Response']['Code'] in [1000, 1001]:
                 continue
             errors.append({'id': resp['ID'], 'code': resp['Response']['Code'], 'error': resp['Response']['Error']})
@@ -711,7 +673,7 @@ class ProtonMail:
             raise CantSetLabel(errors)
         return None
 
-    def unset_label_for_messages(self, label_or_id: Union[Label, str], messages_or_ids: list[Message, str]) -> None:
+    async def unset_label_for_messages(self, label_or_id: Union[Label, str], messages_or_ids: list[Message, str]) -> None:
         """
         Unset label for messages.
 
@@ -723,11 +685,12 @@ class ProtonMail:
             'LabelID': label_or_id.id if isinstance(label_or_id, Label) else label_or_id,
             'IDs': message_ids,
         }
-        response = self._put('mail', 'mail/v4/messages/unlabel', json=payload).json()
-        if response['Code'] not in [1000, 1001]:
-            raise CantUnsetLabel(response['Error'])
+        response = await self._put('mail', 'mail/v4/messages/unlabel', json=payload)
+        response_json = await response.json()
+        if response_json['Code'] not in [1000, 1001]:
+            raise CantUnsetLabel(response_json['Error'])
         errors = []
-        for resp in response['Responses']:
+        for resp in response_json['Responses']:
             if resp['Response']['Code'] in [1000, 1001]:
                 continue
             errors.append({'id': resp['ID'], 'code': resp['Response']['Code'], 'error': resp['Response']['Error']})
@@ -750,19 +713,20 @@ class ProtonMail:
         """
         print("\033[31m{}".format("pgp_import is deprecated and will be removed, you no longer need to use it."))
 
-    def get_user_info(self) -> dict:
+    async def get_user_info(self) -> dict:
         """User information."""
         return self._get('account', 'core/v4/users').json()
 
-    def get_all_sessions(self) -> dict:
+    async def get_all_sessions(self) -> dict:
         """Get a list of all sessions."""
-        return self._get('account', 'auth/v4/sessions').json()
+        response = await self._get('account', 'auth/v4/sessions')
+        return await response.json()
 
     def revoke_all_sessions(self) -> dict:
         """revoke all sessions except the current one."""
         return self._delete('account', 'auth/v4/sessions').json()
 
-    def save_session(self, path: str) -> None:
+    async def save_session(self, path: str) -> None:
         """
         Saving the current session to a file for later loading.
 
@@ -787,10 +751,10 @@ class ProtonMail:
             'headers': headers,
             'cookies': cookies,
         }
-        with open(path, 'wb') as file:
-            pickle.dump(options, file)
+        async with aiofiles.open(path, 'wb') as file:
+            await file.write(pickle.dumps(options))
 
-    def load_session(self, path: str, auto_save: bool = True) -> None:
+    async def load_session(self, path: str, auto_save: bool = True) -> None:
         """
         Loading a previously saved session.
 
@@ -802,8 +766,9 @@ class ProtonMail:
         self._session_path = path
         self._session_auto_save = auto_save
 
-        with open(path, 'rb') as file:
-            options = pickle.load(file)
+        async with aiofiles.open(path, 'rb') as file:
+            content = await file.read()
+            options = pickle.loads(content)
 
         try:
             pgp = options['pgp']
@@ -1105,12 +1070,12 @@ class ProtonMail:
 
         return message
 
-    def _crate_anonym_session(self) -> dict:
+    async def _crate_anonym_session(self) -> dict:
         """Create anonymous session."""
         self.session.headers['x-enforce-unauthsession'] = 'true'
-        anonym_session_data = self._post('account', 'auth/v4/sessions').json()
+        response = await self._post('account', 'auth/v4/sessions')
+        anonym_session_data = await response.json()
         del self.session.headers['x-enforce-unauthsession']
-
         return anonym_session_data
 
     def _parse_info_before_login(self, info, password: str) -> tuple[str, str, str]:
@@ -1160,12 +1125,14 @@ class ProtonMail:
             'purpose': 'login',
             'token': captcha_token,
         }
-        init_data = self._get('account-api', 'captcha/v1/api/init', params=params).json()
+        response = await self._get('account-api', 'captcha/v1/api/init', params=params)
+        init_data = await response.json()
 
         params = {
             'token': init_data['token']
         }
-        image_captcha = self._get('account-api', 'captcha/v1/api/bg', params=params).content
+        response = await self._get('account-api', 'captcha/v1/api/bg', params=params)
+        image_captcha = await response.read()
 
         puzzle_coordinates = get_captcha_puzzle_coordinates(image_captcha)
         if puzzle_coordinates is None:
@@ -1192,9 +1159,9 @@ class ProtonMail:
             'contestId': init_data['contestId'],
             'purpose': 'login'
         }
-        validated = self._get('account-api', 'captcha/v1/api/validate', params=params)
-        if validated.status_code != 200:
-            raise InvalidCaptcha(f"Validate CAPTCHA returns code: {validated.status_code}")
+        validated = await self._get('account-api', 'captcha/v1/api/validate', params=params)
+        if validated.status != 200:
+            raise InvalidCaptcha(f"Validate CAPTCHA returns code: {validated.status}")
 
         return init_data['token']
 
@@ -1209,23 +1176,9 @@ class ProtonMail:
 
         return self.user.authenticated()
 
-    def _get_tokens(self, auth: dict) -> None:
-        self.session.headers['authorization'] = f'{auth["TokenType"]} {auth["AccessToken"]}'
-        self.session.headers['x-pm-uid'] = auth['UID']
-
-        json_data = {
-            'UID': auth['UID'],
-            'ResponseType': 'token',
-            'GrantType': 'refresh_token',
-            'RefreshToken': auth['RefreshToken'],
-            'RedirectURI': 'https://protonmail.com',
-            'Persistent': 0,
-            'State': self.__random_string(24),
-        }
-        response = self._post('mail', 'core/v4/auth/cookies', json=json_data)
-        if response.status_code != 200:
-            raise Exception(f"Can't get refresh token, status: {response.status_code}, json: {response.json()}")
-        self.logger.info("got cookies", "green")
+    async def _upload_attachments(self, attachments: List[Attachment], draft_id: str) -> List[Attachment]:
+        # TODO: Implement async multipart upload using aiohttp
+        raise NotImplementedError("Async attachment upload is not yet implemented.")
 
     def _parse_info_after_login(self, password: str, user_private_key_password: Optional[str] = None) -> None:
         user_info = self.__get_users()['User']
@@ -1530,34 +1483,45 @@ class ProtonMail:
         attachment.is_decrypted = True
         attachment.size = len(content)
 
-    def _get(self, base: str, endpoint: str, **kwargs) -> Response:
-        return self.__request('get', base, endpoint, **kwargs)
+    async def _get(self, base: str, endpoint: str, **kwargs):
+        return await self.__request('get', base, endpoint, **kwargs)
 
-    def _post(self, base: str, endpoint: str, **kwargs) -> Response:
-        return self.__request('post', base, endpoint, **kwargs)
+    async def _post(self, base: str, endpoint: str, **kwargs):
+        return await self.__request('post', base, endpoint, **kwargs)
 
-    def _put(self, base: str, endpoint: str, **kwargs) -> Response:
-        return self.__request('put', base, endpoint, **kwargs)
+    async def _put(self, base: str, endpoint: str, **kwargs):
+        return await self.__request('put', base, endpoint, **kwargs)
 
-    def _delete(self, base: str, endpoint: str, **kwargs) -> Response:
-        return self.__request('delete', base, endpoint, **kwargs)
+    async def _delete(self, base: str, endpoint: str, **kwargs):
+        return await self.__request('delete', base, endpoint, **kwargs)
 
     @delete_duplicates_cookies_and_reset_domain
-    def __request(self, method: str, base: str, endpoint: str, **kwargs) -> Response:
-        methods = {
-            'get': self.session.get,
-            'post': self.session.post,
-            'put': self.session.put,
-            'delete': self.session.delete
-        }
-        response = methods[method](f'{urls_api[base]}/{endpoint}', **kwargs)
-        if response.status_code == 401:  # access token is expired
-            self.__refresh_tokens()
-            response = methods[method](f'{urls_api[base]}/{endpoint}', **kwargs)
+    async def __request(self, method: str, base: str, endpoint: str, **kwargs):
+        if self._client_session is None:
+            raise RuntimeError('Client session is not initialized. Use "async with ProtonMail()" context.')
+        url = f'{urls_api[base]}/{endpoint}'
+        headers = kwargs.pop('headers', self._headers)
+        cookies = kwargs.pop('cookies', self._cookies)
+        data = kwargs.pop('data', None)
+        json_data = kwargs.pop('json', None)
+        params = kwargs.pop('params', None)
+        if method == 'get':
+            response = await self._client_session.get(url, headers=headers, cookies=cookies, params=params)
+        elif method == 'post':
+            response = await self._client_session.post(url, headers=headers, cookies=cookies, params=params, data=data, json=json_data)
+        elif method == 'put':
+            response = await self._client_session.put(url, headers=headers, cookies=cookies, params=params, data=data, json=json_data)
+        elif method == 'delete':
+            response = await self._client_session.delete(url, headers=headers, cookies=cookies, params=params, data=data, json=json_data)
+        else:
+            raise ValueError(f'Unsupported HTTP method: {method}')
+        if response.status == 401:
+            await self.__refresh_tokens()
+            return await self.__request(method, base, endpoint, **kwargs)
         return response
 
-    def __refresh_tokens(self) -> None:
-        response = self._post('mail', 'auth/refresh')
+    async def __refresh_tokens(self) -> None:
+        await self._post('mail', 'auth/refresh')
         if response.status_code != 200:
             raise Exception(f"Can't update tokens, status: {response.status_code} json: {response.json()}")
         if self._session_auto_save:
