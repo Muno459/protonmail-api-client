@@ -39,7 +39,7 @@ This unofficial ProtonMail API client lets you:
 
 ## Installation
 ``` 
-pip install git+https://github.com/Muno459/protonmail-api-client.git
+pip install git+https://github.com/Muno459/aioprotonmail.git
 ```
 
 ## Basic Usage
