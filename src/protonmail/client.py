@@ -27,7 +27,6 @@ import unicodedata
 import aiohttp
 from aiohttp import ClientSession, TCPConnector
 from aiohttp import FormData
-from tqdm.asyncio import tqdm_asyncio
 from requests_toolbelt import MultipartEncoder
 
 from .exceptions import SendMessageError, InvalidTwoFactorCode, LoadSessionError, AddressNotFound, CantUploadAttachment, CantSetLabel, CantUnsetLabel, CantGetLabels, \
@@ -293,18 +292,34 @@ class ProtonMail:
         count_page = ceil(count_info[5]['Total'] / page_size)
         messages_lists = []
         for page_num in range(count_page):
-            page_messages = await self._async_get_messages(self._client_session, page_num, page_size, label_id)
-            messages_lists.append(page_messages)
+            params = {
+                "Page": page_num,
+                "PageSize": page_size,
+                "Limit": page_size,
+                "LabelID": label_id,
+                "Sort": "Time",
+                "Desc": "1",
+            }
+            response = await self._get('mail', 'mail/v4/messages', params=params)
+            messages_data = await response.json()
+            messages_lists.append(messages_data.get('Messages', []))
         messages_dict = self._flattening_lists(messages_lists)
         messages = [self._convert_dict_to_message(message) for message in messages_dict]
         return messages
 
     async def get_messages_by_page(self, page: int, page_size: Optional[int] = 150) -> list[Message]:
         """Get messages by page, sorted by time."""
-        messages_lists = []
-        page_messages = await self._async_get_messages(self._client_session, page, page_size)
-        messages_lists.append(page_messages)
-        messages_dict = self._flattening_lists(messages_lists)
+        params = {
+            "Page": page,
+            "PageSize": page_size,
+            "Limit": page_size,
+            "LabelID": "5",  # All Mail
+            "Sort": "Time",
+            "Desc": "1",
+        }
+        response = await self._get('mail', 'mail/v4/messages', params=params)
+        messages_data = await response.json()
+        messages_dict = messages_data.get('Messages', [])
         messages = [self._convert_dict_to_message(message) for message in messages_dict]
         return messages
 
@@ -340,8 +355,17 @@ class ProtonMail:
         count_page = ceil(count_info[0]['Total'] / page_size)
         conversations_lists = []
         for page_num in range(count_page):
-            page_convos = await self._async_get_conversations(self._client_session, page_num, page_size)
-            conversations_lists.append(page_convos)
+            params = {
+                "Page": page_num,
+                "PageSize": page_size,
+                "Limit": page_size,
+                "LabelID": 0,
+                "Sort": "Time",
+                "Desc": "1",
+            }
+            response = await self._get('mail', 'mail/v4/conversations', params=params)
+            conversations_data = await response.json()
+            conversations_lists.append(conversations_data.get('Conversations', []))
         conversations_dict = self._flattening_lists(conversations_lists)
         conversations = [self._convert_dict_to_conversation(c) for c in conversations_dict]
         return conversations
@@ -352,10 +376,17 @@ class ProtonMail:
             page_size: Optional[int] = 150
     ) -> list[Conversation]:
         """Get conversations by page, sorted by time."""
-        conversations_lists = []
-        page_convos = await self._async_get_conversations(self._client_session, page, page_size)
-        conversations_lists.append(page_convos)
-        conversations_dict = self._flattening_lists(conversations_lists)
+        params = {
+            "Page": page,
+            "PageSize": page_size,
+            "Limit": page_size,
+            "LabelID": 0,
+            "Sort": "Time",
+            "Desc": "1",
+        }
+        response = await self._get('mail', 'mail/v4/conversations', params=params)
+        conversations_data = await response.json()
+        conversations_dict = conversations_data.get('Conversations', [])
         conversations = [self._convert_dict_to_conversation(c) for c in conversations_dict]
         return conversations
 
@@ -396,8 +427,12 @@ class ProtonMail:
         :type attachments: ``list``
         :returns: :py:obj:`list[attachment]`
         """
-        args_list = [(attachment, ) for attachment in attachments]
-        results = await self.__async_process(self._async_download_file, args_list)
+        results = []
+        for attachment in attachments:
+            response = await self._get('mail', f'mail/v4/attachments/{attachment.id}')
+            content = await response.read()
+            results.append((attachment, content))
+        
         threads = [Thread(target=self._file_decrypt, args=result) for result in results]
         [t.start() for t in threads]
         [t.join() for t in threads]
@@ -1372,70 +1407,7 @@ class ProtonMail:
             raise AddressNotFound(address, json_response['Error'])
         return json_response
 
-    def _async_helper(self, func: callable, args_list: list[tuple]) -> list[any]:
-        results = asyncio.run(
-            self.__async_process(func, args_list)
-        )
-        return results
 
-    async def __async_process(
-            self,
-            func: callable,
-            args_list: list[tuple[any]]
-    ) -> list[Coroutine]:
-        connector = TCPConnector(limit=100)
-        headers = dict(self._headers)
-        cookies = dict(self._cookies)
-
-        async with ClientSession(headers=headers, cookies=cookies, connector=connector) as client:
-            funcs = (func(client, *args) for args in args_list)
-            return await tqdm_asyncio.gather(*funcs, desc=func.__name__)
-
-    async def _async_get_messages(
-            self,
-            client: ClientSession,
-            page: int,
-            page_size: Optional[int] = 150,
-            label_id: str = '5',
-    ) -> list:
-        params = {
-            "Page": page,
-            "PageSize": page_size,
-            "Limit": page_size,
-            "LabelID": label_id,
-            "Sort": "Time",
-            "Desc": "1",
-        }
-        response = await client.get(f"{urls_api['mail']}/mail/v4/messages", params=params, proxy=self.proxy, verify_ssl=False)
-        messages = await response.json()
-        return messages['Messages']
-
-    async def _async_get_conversations(
-            self, client: ClientSession,
-            page: int,
-            page_size: Optional[int] = 150
-    ) -> list:
-        params = {
-            "Page": page,
-            "PageSize": page_size,
-            "Limit": page_size,
-            "LabelID": 0,
-            "Sort": "Time",
-            "Desc": "1",
-            # 'Attachments': 1, # only get messages with attachments
-        }
-        response = await client.get(f"{urls_api['mail']}/mail/v4/conversations", params=params, proxy=self.proxy, verify_ssl=False)
-        conversations = await response.json()
-        return conversations['Conversations']
-
-    async def _async_download_file(
-            self, client: ClientSession,
-            image: Attachment
-    ) -> tuple[Attachment, bytes]:
-        _id = image.id
-        response = await client.get(f"{urls_api['mail']}/mail/v4/attachments/{_id}", proxy=self.proxy, verify_ssl=False)
-        content = await response.read()
-        return image, content
 
     def _upload_attachments(self, attachments: list[Attachment], draft_id: str) -> list[Attachment]:
         """upload attachments."""
@@ -1637,11 +1609,12 @@ class ProtonMail:
         return response
 
     async def __refresh_tokens(self) -> None:
-        await self._post('mail', 'auth/refresh')
-        if response.status_code != 200:
-            raise Exception(f"Can't update tokens, status: {response.status_code} json: {response.json()}")
+        response = await self._post('mail', 'auth/refresh')
+        if response.status != 200:
+            response_json = await response.json()
+            raise Exception(f"Can't update tokens, status: {response.status} json: {response_json}")
         if self._session_auto_save:
-            self.save_session(self._session_path)
+            await self.save_session(self._session_path)
 
     async def __addresses(self, params: dict = None) -> dict:
         params = params or {
@@ -1658,40 +1631,3 @@ class ProtonMail:
     async def __get_salts(self) -> dict:
         response = await self._get('account', 'core/v4/keys/salts')
         return await response.json()
-
-"""
-ASYNC MIGRATION COMPLETE!
-
-Usage examples:
-
-1. Using the new async context manager:
-```python
-async with ProtonMail() as proton:
-    proton.session.headers['x-pm-uid'] = 'your_uid_here'
-    proton.session.cookies['AUTH-your_uid'] = 'your_auth_token'
-    proton.session.cookies['REFRESH-your_uid'] = 'your_refresh_token'
-    
-    password = 'YourPassword123'
-    await proton._parse_info_after_login(password)
-    await proton.save_session('session.pickle')
-```
-
-2. Manual session management:
-```python
-proton = ProtonMail()
-await proton.ensure_session()
-
-proton.session.headers['x-pm-uid'] = 'your_uid_here'
-proton.session.cookies['AUTH-your_uid'] = 'your_auth_token'
-proton.session.cookies['REFRESH-your_uid'] = 'your_refresh_token'
-
-password = 'YourPassword123'  
-await proton._parse_info_after_login(password)
-await proton.save_session('session.pickle')
-
-# Don't forget to close the session when done
-await proton._client_session.close()
-```
-
-The session.headers and session.cookies API is backward compatible with the old API.
-"""
