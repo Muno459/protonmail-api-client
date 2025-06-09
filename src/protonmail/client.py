@@ -691,8 +691,6 @@ class ProtonMail:
                 new_message = self._convert_dict_to_message(message['Message'])
                 if new_message.is_draft():  # skip saving draft
                     continue
-                await self.pgp.decrypt(new_message.body)
-                await self._multipart_decrypt(new_message)
                 return new_message
             return None
         message = await self.event_polling(
