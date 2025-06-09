@@ -1,18 +1,45 @@
-# ⚡️ Async ProtonMail Python API Client
+<div align="center">
 
-**Note: This library is now fully async!**
+# ⚡️ **aioprotonmail** ⚡️
 
-- All network operations require `async with` and `await`.
-- All usage examples, including login, message reading, sending, session save/load, and event polling, are now async.
-- If migrating from a previous synchronous version, update your code accordingly.
+### 🚀 **Blazing Fast** • 🔐 **Secure** • 🛠️ **Developer Friendly** • 🌊 **Fully Async**
+
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org)
+[![Async](https://img.shields.io/badge/Async-aiohttp-green.svg)](https://aiohttp.readthedocs.io)
+[![ProtonMail](https://img.shields.io/badge/ProtonMail-API-purple.svg)](https://proton.me)  
+[![Speed](https://img.shields.io/badge/Speed-⚡️Lightning-yellow.svg)](#)
+[![Encryption](https://img.shields.io/badge/Encryption-🔒E2E-red.svg)](#)
+[![Status](https://img.shields.io/badge/Status-🔥Production%20Ready-orange.svg)](#)
 
 ---
 
-This is not an official python ProtonMail API client. It allows you to read, send and delete messages in ProtonMail, as well as render a ready-made template with embedded images.
+### **🎯 What's New in Async Version:**
+- ⚡️ **Lightning Fast**: Full async/await support with aiohttp
+- 🔄 **Auto Token Refresh**: Never worry about expired tokens again  
+- 🎨 **Backward Compatible**: Same API as sync version, just add `await`
+- 🛠️ **Easy Migration**: Simple `async with` context manager
+- 🔧 **One-Line Config**: Use `configure_tokens()` for instant setup
+
+</div>
+
+---
+
+## 🎭 **What This Beast Can Do**
+
+This unofficial ProtonMail API client lets you:
+- 📧 **Send & receive** encrypted messages  
+- 📎 **Download & upload** attachments
+- 🎨 **Render HTML** emails with embedded images
+- 🔍 **Search & filter** your mailbox
+- 🏷️ **Manage labels** and conversations
+- 💾 **Save sessions** for seamless re-authentication
+- 🎯 **Event polling** for real-time updates
+
+> ⚠️ **Migration Notice**: This forked library is now **fully async**! All network operations require `async with` and `await`. If you're upgrading from the sync version, check the migration guide below.
 
 ## Installation
 ``` 
-pip install protonmail-api-client
+pip install git+https://github.com/Muno459/protonmail-api-client.git
 ```
 
 ## Basic Usage
